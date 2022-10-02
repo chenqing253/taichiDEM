@@ -7,13 +7,17 @@ vec = ti.math.vec2
 
 SAVE_FRAMES = False
 
-window_size = 1024  # Number of pixels of the window
+window_size = 512 #1024   # Number of pixels of the window
 n = 8192  # Number of grains
 
+coefficient = 0.50
 density = 100.0
+density = 2650e3
 stiffness = 8e3
+stiffness = 1e8
 restitution_coef = 0.001
-gravity = -9.81
+gravity = -9.81e-00
+rotation = True
 dt = 0.0001  # Larger dt might lead to unstable results.
 substeps = 60
 
@@ -26,6 +30,13 @@ class Grain:
     v: vec  # Velocity
     a: vec  # Acceleration
     f: vec  # Force
+    o: ti.f32  # orientation
+    I: ti.f32  # inertia
+    # only magnitude, sign represent direction in z
+    w: ti.f32  # angular velocity
+    L: ti.f32  # angular acceleration, emm, though usualaly we use alpha
+    T: ti.f32  # torque
+
 
 
 gf = Grain.field(shape=(n, ))
@@ -35,7 +46,9 @@ grid_size = 1.0 / grid_n  # Simulation domain of size [0, 1]
 print(f"Grid size: {grid_n}x{grid_n}")
 
 grain_r_min = 0.002
+#grain_r_min = 0.0039
 grain_r_max = 0.003
+#grain_r_max = 0.0039
 
 assert grain_r_max * 2 < grid_size
 
@@ -45,13 +58,17 @@ def init():
     for i in gf:
         # Spread grains in a restricted area.
         l = i * grid_size
-        padding = 0.1
-        region_width = 1.0 - padding * 2
+        padding = 0.10
+        region_width = 1.0 - padding * 2#2
         pos = vec(l % region_width + padding + grid_size * ti.random() * 0.2,
-                  l // region_width * grid_size + 0.3)
+                 l // region_width * grid_size + 0.0)
+        #pos = vec(l % region_width + 0.0 + grid_size * ti.random() * 0.2,
+        #          l // region_width * grid_size + 0.0)
         gf[i].p = pos
         gf[i].r = ti.random() * (grain_r_max - grain_r_min) + grain_r_min
         gf[i].m = density * math.pi * gf[i].r**2
+        gf[i].o = 0.0 
+        gf[i].I = 0.5 * gf[i].m * gf[i].r**2  # 1/2*m*r^2 is interia for solid disk/cylinder along z axis
 
 
 @ti.kernel
@@ -61,6 +78,10 @@ def update():
         gf[i].v += (gf[i].a + a) * dt / 2.0
         gf[i].p += gf[i].v * dt + 0.5 * a * dt**2
         gf[i].a = a
+        L = gf[i].T / gf[i].I
+        gf[i].w += (gf[i].L + L) * dt / 2.0 
+        gf[i].o += gf[i].w * dt + 0.5 * L * dt**2
+        gf[i].L = L
 
 
 @ti.kernel
@@ -93,17 +114,53 @@ def resolve(i, j):
     dist = ti.sqrt(rel_pos[0]**2 + rel_pos[1]**2)
     delta = -dist + gf[i].r + gf[j].r  # delta = d - 2 * r
     if delta > 0:  # in contact
+        # normal force
         normal = rel_pos / dist
-        f1 = normal * delta * stiffness
+        fn = normal * delta * stiffness
+        # shear force: 
+        c_pos = gf[i].p + normal * ( gf[i].r - 0.5 * delta )
+        cr1 = c_pos - gf[i].p 
+        cr2 = c_pos - gf[j].p 
+        distcr1 = ti.sqrt(cr1[0]**2 + cr1[1]**2)
+        distcr2 = ti.sqrt(cr2[0]**2 + cr2[1]**2)
+        rel_v = (gf[j].v - gf[i].v) 
+        rel_n = (rel_v * normal) * normal
+        rel_t = rel_v - rel_n
+        tangent = vec( -normal[1], normal[0] )
+        vs = ( rel_v * tangent ) - gf[j].w * distcr2 - gf[i].w * distcr1 
+        delta_s = vs * dt
+        ## notice , fs should calculate in a cumulate way, 
+        ## i.e. the fs would be record in the contact (if the contact still exist)
+        ## fs -= stiffness * delta_s * tangent
+        fs = - stiffness * delta_s * tangent
+        ### friction check
+        mag_fs = ti.sqrt(fs[0]**2 + fs[1]**2)
+        max_fs = coefficient * delta * stiffness
+        if ( mag_fs > max_fs ):
+            fs = fs * max_fs / mag_fs
         # Damping force
         M = (gf[i].m * gf[j].m) / (gf[i].m + gf[j].m)
         K = stiffness
         C = 2. * (1. / ti.sqrt(1. + (math.pi / ti.log(restitution_coef))**2)
                   ) * ti.sqrt(K * M)
         V = (gf[j].v - gf[i].v) * normal
-        f2 = C * V * normal
-        gf[i].f += f2 - f1
-        gf[j].f -= f2 - f1
+        Vs = (gf[j].v - gf[i].v) * tangent
+        fd = C * V * normal
+        #if (rotation):
+        #    fd = C * V * normal + C * Vs * tangent
+        # total force:
+        fsum = fn
+        if (rotation):
+            fsum = fn + fs
+        gf[i].f += fd - fsum
+        gf[j].f -= fd - fsum
+        # total torque
+        if (rotation):
+            gf[i].T += - cr1.cross(fs) 
+            gf[j].T -= - cr2.cross(fs) 
+            #gf[i].T += cr1.cross(fd) - cr1.cross(fs) 
+            #gf[j].T -= cr2.cross(fd) - cr2.cross(fs) 
+        
 
 
 list_head = ti.field(dtype=ti.i32, shape=grid_n * grid_n)
@@ -203,7 +260,21 @@ while gui.running:
         contact(gf)
     pos = gf.p.to_numpy()
     r = gf.r.to_numpy() * window_size
-    gui.circles(pos, radius=r)
+    
+    import numpy as np
+    ori = gf.o.to_numpy()
+    indices = np.zeros(n,dtype=int)
+    meanOri = np.mean(abs(ori))
+    #print(meanOri)
+    for i in range(0,len(indices)):
+        if (ori[i] > (meanOri)):
+            indices[i]=1
+        elif (ori[i] < -meanOri ):
+            indices[i]=2
+    colors = np.array([ 0xEEEEF0, 0xED553B, 0x068587], dtype=np.uint32) 
+
+    #gui.circles( pos, radius=r, palette=colors,palette_indices=indices )
+    gui.circles( pos, radius=r, color=colors[indices] )
     if SAVE_FRAMES:
         gui.show(f'output/{step:06d}.png')
     else:
