@@ -12,9 +12,9 @@ n = 8192  # Number of grains
 
 coefficient = 0.50
 density = 100.0
-density = 2650e3
+#density = 2650
 stiffness = 8e3
-stiffness = 1e8
+#stiffness = 1e8
 restitution_coef = 0.001
 gravity = -9.81e-00
 rotation = True
@@ -24,6 +24,7 @@ substeps = 60
 
 @ti.dataclass
 class Grain:
+    id: ti.i32 # id of particle
     p: vec  # Position
     m: ti.f32  # Mass
     r: ti.f32  # Radius
@@ -36,8 +37,12 @@ class Grain:
     w: ti.f32  # angular velocity
     L: ti.f32  # angular acceleration, emm, though usualaly we use alpha
     T: ti.f32  # torque
+    #oldfs: ti.field(dtype=ti.i32, shape=(10))
 
-
+oldct = ti.field(dtype=ti.i32, shape=(n,10)) # contact in the prev 
+curct = ti.field(dtype=ti.i32, shape=(n,10)) # contact in the curr 
+oldfs = ti.field(dtype=ti.f32, shape=(n,10)) # shear force in prev
+curfs = ti.field(dtype=ti.f32, shape=(n,10)) # shear force in curr
 
 gf = Grain.field(shape=(n, ))
 
@@ -46,7 +51,7 @@ grid_size = 1.0 / grid_n  # Simulation domain of size [0, 1]
 print(f"Grid size: {grid_n}x{grid_n}")
 
 grain_r_min = 0.002
-#grain_r_min = 0.0039
+#grain_r_min = 0.0038
 grain_r_max = 0.003
 #grain_r_max = 0.0039
 
@@ -56,21 +61,23 @@ assert grain_r_max * 2 < grid_size
 @ti.kernel
 def init():
     for i in gf:
+        # assign unique id to particle 1-8192
+        gf[i].id = i + 1
         # Spread grains in a restricted area.
         l = i * grid_size
         padding = 0.10
         region_width = 1.0 - padding * 2#2
-        pos = vec(l % region_width + padding + grid_size * ti.random() * 0.2,
+        pos = vec(l % region_width + 0.0 + grid_size * ti.random() * 0.2,
                  l // region_width * grid_size + 0.0)
-        #pos = vec(l % region_width + 0.0 + grid_size * ti.random() * 0.2,
+        #pos = vec(l % region_width + padding + grid_size * ti.random() * 0.2,
         #          l // region_width * grid_size + 0.0)
         gf[i].p = pos
         gf[i].r = ti.random() * (grain_r_max - grain_r_min) + grain_r_min
         gf[i].m = density * math.pi * gf[i].r**2
         gf[i].o = 0.0 
         gf[i].I = 0.5 * gf[i].m * gf[i].r**2  # 1/2*m*r^2 is interia for solid disk/cylinder along z axis
-
-
+        #gf[i]if (i==8192):  print(i)
+  
 @ti.kernel
 def update():
     for i in gf:
@@ -79,10 +86,19 @@ def update():
         gf[i].p += gf[i].v * dt + 0.5 * a * dt**2
         gf[i].a = a
         L = gf[i].T / gf[i].I
-        gf[i].w += (gf[i].L + L) * dt / 2.0 
+        #gf[i].w += (gf[i].L + L) * dt / 2.0 
+        gf[i].w += ( L ) * dt 
         gf[i].o += gf[i].w * dt + 0.5 * L * dt**2
         gf[i].L = L
-
+        #if (L!=0):177
+        #if ( i==177 ):
+        #    print("particle id",i,gf[i].w,gf[i].o,L)
+        for k in range(10):
+            oldct[i,k] = curct[i,k]
+            curct[i,k] = 0
+            oldfs[i,k] = curfs[i,k]
+            #curfs[i,k] = 0
+         
 
 @ti.kernel
 def apply_bc():
@@ -110,10 +126,24 @@ def apply_bc():
 
 @ti.func
 def resolve(i, j):
+    # find (i,j) is exist in old contact 
+    old_fs = gf[i].m
+    for k in range(10):
+        if (oldct[i,k] == gf[j].id):
+            old_fs = oldfs[i,k]
+
     rel_pos = gf[j].p - gf[i].p
     dist = ti.sqrt(rel_pos[0]**2 + rel_pos[1]**2)
     delta = -dist + gf[i].r + gf[j].r  # delta = d - 2 * r
     if delta > 0:  # in contact
+        # update contact 
+        tmp_index = 0
+        for k in range(10):
+            if (curct[i,k] == 0): 
+                pass 
+            else:
+                tmp_index += 1 
+        curct[i,tmp_index] = gf[j].id
         # normal force
         normal = rel_pos / dist
         fn = normal * delta * stiffness
@@ -124,42 +154,64 @@ def resolve(i, j):
         distcr1 = ti.sqrt(cr1[0]**2 + cr1[1]**2)
         distcr2 = ti.sqrt(cr2[0]**2 + cr2[1]**2)
         rel_v = (gf[j].v - gf[i].v) 
-        rel_n = (rel_v * normal) * normal
+        rel_n = ( rel_v.dot(normal) ) * normal
         rel_t = rel_v - rel_n
+        mag_rel_t = ti.sqrt(rel_t[0]**2 + rel_t[1]**2)
+        #tangent = rel_t / mag_rel_t
         tangent = vec( -normal[1], normal[0] )
-        vs = ( rel_v * tangent ) - gf[j].w * distcr2 - gf[i].w * distcr1 
+        vs = ( mag_rel_t ) - gf[j].w * distcr2 - gf[i].w * distcr1 
+        #delta_s = rel_t * dt
         delta_s = vs * dt
         ## notice , fs should calculate in a cumulate way, 
         ## i.e. the fs would be record in the contact (if the contact still exist)
         ## fs -= stiffness * delta_s * tangent
-        fs = - stiffness * delta_s * tangent
+        del_fs = - stiffness * delta_s * tangent
+        fs = old_fs * tangent + del_fs
         ### friction check
         mag_fs = ti.sqrt(fs[0]**2 + fs[1]**2)
         max_fs = coefficient * delta * stiffness
         if ( mag_fs > max_fs ):
             fs = fs * max_fs / mag_fs
-        # Damping force
+            mag_fs = max_fs
+        curfs[i,tmp_index] = mag_fs
+        #if (i==0):
+        #    print("===")
+        #    print(curfs[i,tmp_index])
+        #    print(stiffness*delta)
+        #    print("===")
+         # Damping force
         M = (gf[i].m * gf[j].m) / (gf[i].m + gf[j].m)
         K = stiffness
-        C = 2. * (1. / ti.sqrt(1. + (math.pi / ti.log(restitution_coef))**2)
-                  ) * ti.sqrt(K * M)
+        beta = ( 1. / ti.sqrt(1. + (math.pi / ti.log(restitution_coef))**2) )
+        C = 2. * beta * ti.sqrt(K * M)
         V = (gf[j].v - gf[i].v) * normal
         Vs = (gf[j].v - gf[i].v) * tangent
         fd = C * V * normal
-        #if (rotation):
-        #    fd = C * V * normal + C * Vs * tangent
+        if (rotation):
+            fd = C * V * normal + C * Vs * tangent
         # total force:
+        assert (fs[0]**2 + fs[1]**2) < coefficient * (fn[0]**2 + fn[1]**2)
         fsum = fn
         if (rotation):
             fsum = fn + fs
-        gf[i].f += fd - fsum
-        gf[j].f -= fd - fsum
+        gf[i].f +=  fd - fsum
+        gf[j].f -=  fd - fsum
         # total torque
         if (rotation):
             gf[i].T += - cr1.cross(fs) 
-            gf[j].T -= - cr2.cross(fs) 
+            gf[j].T -= - cr2.cross(fs)
+            """tmp = cr1.cross(tangent)
+            print(tmp)
+            #print(type(tmp))
+            sign = gf[i].T
+            if ( tmp > 0 ):
+                sign = 1.0
+            else:
+                sign = -1.0
+            gf[i].T += -sign * distcr1 * mag_fs
+            gf[i].T -= -sign * distcr2 * mag_fs
             #gf[i].T += cr1.cross(fd) - cr1.cross(fs) 
-            #gf[j].T -= cr2.cross(fd) - cr2.cross(fs) 
+            #gf[j].T -= cr2.cross(fd) - cr2.cross(fs) """
         
 
 
