@@ -8,17 +8,19 @@ vec = ti.math.vec2
 SAVE_FRAMES = False
 
 window_size = 512 #1024   # Number of pixels of the window
-n = 8192  # Number of grains
+n = int(8192/2 )  # Number of grains
 
-coefficient = 0.50
+
+coefficient = 0.75
 density = 100.0
 #density = 2650
 stiffness = 8e3
 #stiffness = 1e8
 restitution_coef = 0.001
-gravity = -9.81e-00
-rotation = True
-dt = 0.0001  # Larger dt might lead to unstable results.
+gravity = -9.81e-2
+rotation = False
+dt = 0.0001#0.0001  # Larger dt might lead to unstable results.
+# dt_crit = sqrt(m/stiffness)
 substeps = 60
 
 
@@ -56,6 +58,8 @@ grain_r_max = 0.003
 #grain_r_max = 0.0039
 
 assert grain_r_max * 2 < grid_size
+dt_crit = math.sqrt(density*math.pi*grain_r_min**2/stiffness)
+print(f"critical time step : {dt_crit}")
 
 
 @ti.kernel
@@ -66,9 +70,9 @@ def init():
         # Spread grains in a restricted area.
         l = i * grid_size
         padding = 0.10
-        region_width = 1.0 - padding * 2#2
-        pos = vec(l % region_width + 0.0 + grid_size * ti.random() * 0.2,
-                 l // region_width * grid_size + 0.0)
+        region_width = 0.5# 1.0 - padding * 2#2
+        pos = vec(l % region_width + grid_size * ti.random() * 0.2 + 0.25  ,
+                 l // region_width * grid_size + grid_size * 0.5 + 0.0)
         #pos = vec(l % region_width + padding + grid_size * ti.random() * 0.2,
         #          l // region_width * grid_size + 0.0)
         gf[i].p = pos
@@ -127,12 +131,13 @@ def apply_bc():
 @ti.func
 def resolve(i, j):
     # find (i,j) is exist in old contact 
-    old_fs = gf[i].m
+    old_fs = gf[i].m - gf[i].m
     for k in range(10):
         if (oldct[i,k] == gf[j].id):
             old_fs = oldfs[i,k]
 
     rel_pos = gf[j].p - gf[i].p
+    rel_v = gf[j].v - gf[i].v
     dist = ti.sqrt(rel_pos[0]**2 + rel_pos[1]**2)
     delta = -dist + gf[i].r + gf[j].r  # delta = d - 2 * r
     if delta > 0:  # in contact
@@ -146,73 +151,47 @@ def resolve(i, j):
         curct[i,tmp_index] = gf[j].id
         # normal force
         normal = rel_pos / dist
-        fn = normal * delta * stiffness
+        fn = delta * stiffness
+        Fn = fn * normal
         # shear force: 
+        tangent = vec( -normal[1], normal[0] )
         c_pos = gf[i].p + normal * ( gf[i].r - 0.5 * delta )
         cr1 = c_pos - gf[i].p 
         cr2 = c_pos - gf[j].p 
         distcr1 = ti.sqrt(cr1[0]**2 + cr1[1]**2)
-        distcr2 = ti.sqrt(cr2[0]**2 + cr2[1]**2)
-        rel_v = (gf[j].v - gf[i].v) 
-        rel_n = ( rel_v.dot(normal) ) * normal
-        rel_t = rel_v - rel_n
-        mag_rel_t = ti.sqrt(rel_t[0]**2 + rel_t[1]**2)
-        #tangent = rel_t / mag_rel_t
-        tangent = vec( -normal[1], normal[0] )
-        vs = ( mag_rel_t ) - gf[j].w * distcr2 - gf[i].w * distcr1 
-        #delta_s = rel_t * dt
-        delta_s = vs * dt
-        ## notice , fs should calculate in a cumulate way, 
-        ## i.e. the fs would be record in the contact (if the contact still exist)
-        ## fs -= stiffness * delta_s * tangent
-        del_fs = - stiffness * delta_s * tangent
-        fs = old_fs * tangent + del_fs
+        distcr2 = ti.sqrt(cr2[0]**2 + cr2[1]**2) 
+        rel_vn = ( rel_v.dot(normal) ) * normal
+        rel_vt = rel_v - rel_vn
+        ds = ( rel_v.dot(tangent) ) #- gf[j].w * distcr2 - gf[i].w * distcr1 
+        rel_ds = ds * dt
+        del_fs = - 0.01 * stiffness * rel_ds 
+        fs = old_fs + del_fs
         ### friction check
-        mag_fs = ti.sqrt(fs[0]**2 + fs[1]**2)
-        max_fs = coefficient * delta * stiffness
-        if ( mag_fs > max_fs ):
-            fs = fs * max_fs / mag_fs
-            mag_fs = max_fs
-        curfs[i,tmp_index] = mag_fs
-        #if (i==0):
-        #    print("===")
-        #    print(curfs[i,tmp_index])
-        #    print(stiffness*delta)
-        #    print("===")
-         # Damping force
+        max_fs = coefficient * fn
+        if ( fs > max_fs ):
+            fs = max_fs
+        curfs[i,tmp_index] = fs
+        assert fs < coefficient * fn
+        Fs = fs * tangent
+        # Damping force
         M = (gf[i].m * gf[j].m) / (gf[i].m + gf[j].m)
         K = stiffness
         beta = ( 1. / ti.sqrt(1. + (math.pi / ti.log(restitution_coef))**2) )
         C = 2. * beta * ti.sqrt(K * M)
-        V = (gf[j].v - gf[i].v) * normal
-        Vs = (gf[j].v - gf[i].v) * tangent
-        fd = C * V * normal
-        if (rotation):
-            fd = C * V * normal + C * Vs * tangent
+        Vn = rel_v.dot(normal)
+        Vs = rel_v.dot(tangent) 
+        Fd = C * Vn * normal 
+        if ( rotation ):
+            Fd = C * Vn * normal  + 0.01*C * Vs * tangent
         # total force:
-        assert (fs[0]**2 + fs[1]**2) < coefficient * (fn[0]**2 + fn[1]**2)
-        fsum = fn
-        if (rotation):
-            fsum = fn + fs
-        gf[i].f +=  fd - fsum
-        gf[j].f -=  fd - fsum
-        # total torque
-        if (rotation):
-            gf[i].T += - cr1.cross(fs) 
-            gf[j].T -= - cr2.cross(fs)
-            """tmp = cr1.cross(tangent)
-            print(tmp)
-            #print(type(tmp))
-            sign = gf[i].T
-            if ( tmp > 0 ):
-                sign = 1.0
-            else:
-                sign = -1.0
-            gf[i].T += -sign * distcr1 * mag_fs
-            gf[i].T -= -sign * distcr2 * mag_fs
-            #gf[i].T += cr1.cross(fd) - cr1.cross(fs) 
-            #gf[j].T -= cr2.cross(fd) - cr2.cross(fs) """
-        
+        if ( rotation ):
+            gf[i].f += Fd - Fn - Fs
+            gf[j].f -= Fd - Fn - Fs 
+        else:
+            gf[i].f += Fd - Fn 
+            gf[j].f -= Fd - Fn  
+         # total torque
+         
 
 
 list_head = ti.field(dtype=ti.i32, shape=grid_n * grid_n)
