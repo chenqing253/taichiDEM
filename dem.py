@@ -298,7 +298,7 @@ while gui.running:
     ori = gf.o.to_numpy()
     indices = np.zeros(n,dtype=int)
     meanOri = np.mean(abs(ori))
-    print(meanOri)
+    #print(meanOri)
     for i in range(0,len(indices)):
         if (ori[i] > (meanOri)):
             indices[i]=1
