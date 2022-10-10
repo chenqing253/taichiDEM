@@ -8,7 +8,7 @@ vec = ti.math.vec2
 SAVE_FRAMES = False
 
 window_size = 512 #1024   # Number of pixels of the window
-n = int(8192/2 )  # Number of grains
+n = int(8192 )  # Number of grains
 
 
 coefficient = 0.75
@@ -18,7 +18,7 @@ stiffness = 8e3
 #stiffness = 1e8
 restitution_coef = 0.001
 gravity = -9.81e-2
-rotation = False
+rotation = True
 dt = 0.0001#0.0001  # Larger dt might lead to unstable results.
 # dt_crit = sqrt(m/stiffness)
 substeps = 60
@@ -71,7 +71,7 @@ def init():
         l = i * grid_size
         padding = 0.10
         region_width = 0.5# 1.0 - padding * 2#2
-        pos = vec(l % region_width + grid_size * ti.random() * 0.2 + 0.25  ,
+        pos = vec(l % region_width + grid_size * ti.random() * 0.20 + 0.0  ,
                  l // region_width * grid_size + grid_size * 0.5 + 0.0)
         #pos = vec(l % region_width + padding + grid_size * ti.random() * 0.2,
         #          l // region_width * grid_size + 0.0)
@@ -162,7 +162,7 @@ def resolve(i, j):
         distcr2 = ti.sqrt(cr2[0]**2 + cr2[1]**2) 
         rel_vn = ( rel_v.dot(normal) ) * normal
         rel_vt = rel_v - rel_vn
-        ds = ( rel_v.dot(tangent) ) #- gf[j].w * distcr2 - gf[i].w * distcr1 
+        ds = ( rel_v.dot(tangent) ) # + gf[j].w * distcr2 - gf[i].w * distcr1 
         rel_ds = ds * dt
         del_fs = - 0.01 * stiffness * rel_ds 
         fs = old_fs + del_fs
@@ -191,7 +191,9 @@ def resolve(i, j):
             gf[i].f += Fd - Fn 
             gf[j].f -= Fd - Fn  
          # total torque
-         
+        #if ( rotation ):
+            #gf[i].T +=  cr1.cross(Fs)
+            #gf[j].T -=  cr2.cross(Fs)
 
 
 list_head = ti.field(dtype=ti.i32, shape=grid_n * grid_n)
@@ -296,7 +298,7 @@ while gui.running:
     ori = gf.o.to_numpy()
     indices = np.zeros(n,dtype=int)
     meanOri = np.mean(abs(ori))
-    #print(meanOri)
+    print(meanOri)
     for i in range(0,len(indices)):
         if (ori[i] > (meanOri)):
             indices[i]=1
